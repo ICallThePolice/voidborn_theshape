@@ -1,0 +1,169 @@
+#pragma kernel CSMain
+
+// Структуры и буферы
+struct BiomeData {
+    float heightOffset;
+};
+StructuredBuffer<BiomeData> _BiomeData;
+RWStructuredBuffer<float> densityBuffer;
+
+// Переменные
+int3 chunkPosition;
+int3 chunkSize;
+int numBiomes;
+
+// Глобальные настройки генерации
+float _Amplitude;
+float _Frequency;
+float _SurfaceLevel;
+float _BiomeMapScale;
+
+// Настройки для фрактального шума (fBm)
+#define NUM_OCTAVES 5 // Количество слоев шума для детализации
+float _Lacunarity = 2.0; // Множитель частоты для каждой следующей октавы
+float _Persistence = 0.5; // Множитель амплитуды для каждой следующей октавы
+
+
+// --- Реализация Simplex Noise (без изменений) ---
+float3 mod289(float3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+float4 mod289(float4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+float4 permute(float4 x) { return mod289(((x * 34.0) + 1.0) * x); }
+float4 taylorInvSqrt(float4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+float snoise(float3 v) {
+    const float2 C = float2(1.0 / 6.0, 1.0 / 3.0);
+    const float4 D = float4(0.0, 0.5, 1.0, 2.0);
+    float3 i = floor(v + dot(v, C.yyy));
+    float3 x0 = v - i + dot(i, C.xxx);
+    float3 g = step(x0.yzx, x0.xyz);
+    float3 l = 1.0 - g;
+    float3 i1 = min(g.xyz, l.zxy);
+    float3 i2 = max(g.xyz, l.zxy);
+    float3 x1 = x0 - i1 + C.xxx;
+    float3 x2 = x0 - i2 + C.yyy;
+    float3 x3 = x0 - D.yyy;
+    i = mod289(i);
+    float4 p = permute(permute(permute(
+        i.z + float4(0.0, i1.z, i2.z, 1.0))
+        + i.y + float4(0.0, i1.y, i2.y, 1.0))
+        + i.x + float4(0.0, i1.x, i2.x, 1.0));
+    float n_ = 0.142857142857;
+    float3 ns = n_ * D.wyz - D.xzx;
+    float4 j = p - 49.0 * floor(p * ns.z * ns.z);
+    float4 x_ = floor(j * ns.z);
+    float4 y_ = floor(j - 7.0 * x_);
+    float4 x = x_ * ns.x + ns.yyyy;
+    float4 y = y_ * ns.x + ns.yyyy;
+    float4 h = 1.0 - abs(x) - abs(y);
+    float4 b0 = float4(x.xy, y.xy);
+    float4 b1 = float4(x.zw, y.zw);
+    float4 s0 = floor(b0) * 2.0 + 1.0;
+    float4 s1 = floor(b1) * 2.0 + 1.0;
+    float4 sh = -step(h, 0.0);
+    float4 a0 = b0.xzyw + s0.xzyw * sh.xxyy;
+    float4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
+    float3 p0 = float3(a0.xy, h.x);
+    float3 p1 = float3(a0.zw, h.y);
+    float3 p2 = float3(a1.xy, h.z);
+    float3 p3 = float3(a1.zw, h.w);
+    float4 norm = taylorInvSqrt(float4(dot(p0, p0), dot(p1, p1), dot(p2, p2), dot(p3, p3)));
+    p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+    float4 m = max(0.6 - float4(dot(x0, x0), dot(x1, x1), dot(x2, x2), dot(x3, x3)), 0.0);
+    m = m * m;
+    return 42.0 * dot(m * m, float4(dot(p0, x0), dot(p1, x1), dot(p2, x2), dot(p3, x3)));
+}
+
+// --- НОВАЯ ФУНКЦИЯ: Фрактальный шум (fBm) ---
+// Суммирует несколько слоев (октав) шума для создания детализированного ландшафта
+float fractalNoise(float3 pos)
+{
+    float total = 0;
+    float frequency = _Frequency;
+    float amplitude = _Amplitude;
+    float maxValue = 0; // Используется для нормализации результата в диапазон [-1, 1]
+
+    for (int i = 0; i < NUM_OCTAVES; i++)
+    {
+        total += snoise(pos * frequency) * amplitude;
+        maxValue += amplitude;
+        amplitude *= _Persistence;
+        frequency *= _Lacunarity;
+    }
+    return total / maxValue;
+}
+
+// --- НОВАЯ НАДЕЖНАЯ ВЕРСИЯ ШУМА ВОРОНОГО ---
+// Надежная хеш-функция
+float2 hash22(float2 p)
+{
+    p = float2(dot(p, float2(127.1, 311.7)), dot(p, float2(269.5, 183.3)));
+    return -1.0 + 2.0 * frac(sin(p) * 43758.5453123);
+}
+
+// Функция возвращает ID биома и вес смешивания
+void worleyNoise(float2 pos, out uint biomeID, out float blendWeight)
+{
+    float2 grid_pos = floor(pos);
+    float2 frac_pos = frac(pos);
+    
+    float closestDist = 100.0;
+    float secondClosestDist = 100.0;
+    biomeID = 0;
+
+    for (int y = -1; y <= 1; y++)
+    {
+        for (int x = -1; x <= 1; x++)
+        {
+            float2 neighbor_cell = float2(x, y);
+            float2 cell_pos = grid_pos + neighbor_cell;
+            float2 random_point_offset = hash22(cell_pos);
+            float dist = distance(frac_pos, neighbor_cell + random_point_offset);
+            
+            if (dist < closestDist)
+            {
+                secondClosestDist = closestDist;
+                closestDist = dist;
+                biomeID = (uint)abs(cell_pos.x * 15485863 + cell_pos.y * 32452843) % numBiomes;
+            }
+            else if (dist < secondClosestDist)
+            {
+                secondClosestDist = dist;
+            }
+        }
+    }
+    
+    // Вычисляем вес смешивания для плавных границ
+    blendWeight = saturate(closestDist / (closestDist + secondClosestDist));
+    blendWeight = smoothstep(0.0, 1.0, blendWeight);
+}
+
+
+[numthreads(8,8,8)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    int index = id.x + id.y * chunkSize.x + id.z * (chunkSize.x * chunkSize.y);
+    int totalVoxels = chunkSize.x * chunkSize.y * chunkSize.z;
+    if (index >= totalVoxels) return;
+
+    float3 worldPos = id + chunkPosition * chunkSize;
+    
+    // 1. --- ГЕНЕРИРУЕМ БАЗОВЫЙ ЛАНДШАФТ ---
+    // Используем фрактальный шум для создания детализированной поверхности
+    float noiseValue = fractalNoise(worldPos);
+
+    // 2. --- ОПРЕДЕЛЯЕМ БИОМ И ВЕС СМЕШИВАНИЯ ---
+    uint biomeID;
+    float blendWeight;
+    worleyNoise(worldPos.xz * _BiomeMapScale, biomeID, blendWeight);
+    
+    // 3. --- ПРИМЕНЯЕМ МОДИФИКАТОРЫ ---
+    // Пока у нас только один модификатор, но архитектура готова к расширению
+    BiomeData biome = _BiomeData[biomeID];
+    float biomeModification = biome.heightOffset;
+    
+    // 4. --- ВЫЧИСЛЯЕМ ИТОГОВУЮ ПЛОТНОСТЬ ---
+    float density = _SurfaceLevel - worldPos.y;
+    density += noiseValue * _Amplitude; // Применяем основной шум
+    density += biomeModification; // Применяем модификацию от биома
+    
+    densityBuffer[index] = density;
+}
